@@ -28,7 +28,7 @@ FIND_FILE(TRAX_HEADER NAMES trax.h)
 IF (EXISTS ${TRAX_HEADER})
     GET_FILENAME_COMPONENT(TRAX_DIR ${TRAX_HEADER} DIRECTORY)
     ADD_DEFINITIONS(-DTRAX) # Added to enable TraX protocol support
-    LINK_DIRECTORIES(${TRAX_DIR}) # Add library directory
+    LINK_DIRECTORIES(${TRAX_DIR}/../lib) # Add library directory
     INCLUDE_DIRECTORIES(${TRAX_DIR}) # Add includes directory
 
     add_executable(kcf_trax main_trax.cpp)
