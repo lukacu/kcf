@@ -33,7 +33,9 @@ This code compiles into binary **kcf_vot**
 
 ./kcf_trax
 - using VOT 2014+ trax protocol (http://www.votchallenge.net/)
-
+- require [trax](https://github.com/votchallenge/trax) library to be compiled
+  with opencv support and installed. See trax instruction for compiling and
+  installing.
 
 ___________
 Performance
@@ -41,8 +43,9 @@ Performance
 |  | **VOT2016 - baseline EAO** | **VOT2016 - unsupervised EAO** |    [**TV77**](http://cmp.felk.cvut.cz/~vojirtom/dataset/index.html) Avg. Recall |
 |:---------------|:--------------:|:------------------:|:----------------:|
 |  kcf          |0.1530        |   0.3859         |      51%       |
-|  skcf         |0.1661        |   **0.4155**         |      56%       |
-|  skcf-cn      |**0.1783**        |   0.4136         |      **58%**       |
+|  skcf         |0.1661        |   0.4155         |      56%       |
+|  skcf-cn      |0.178        |   0.4136         |      58%       |
+|  kcf-master   |**0.1994**    |   **0.4376**     |       **63%**  |
 
 __________
 References
