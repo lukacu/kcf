@@ -60,22 +60,23 @@ void KCF_Tracker::init(cv::Mat &img, const cv::Rect & bbox)
     p_windows_size[0] = round(p_pose.w * (1. + p_padding) / p_cell_size) * p_cell_size;
     p_windows_size[1] = round(p_pose.h * (1. + p_padding) / p_cell_size) * p_cell_size;
 
+    p_scales.clear();
     if (m_use_scale)
-        for (int i = -p_num_scales/2; i < p_num_scales/2; ++i)
+        for (int i = -p_num_scales/2; i <= p_num_scales/2; ++i)
             p_scales.push_back(std::pow(p_scale_step, i));
     else
         p_scales.push_back(1.);
 
     p_current_scale = 1.;
 
-    double min_size_ratio = std::max(2.*p_cell_size/p_windows_size[0], 2.*p_cell_size/p_windows_size[1]);
-    double max_size_ratio = std::min(floor(img.cols/p_cell_size)*p_cell_size/p_windows_size[0], floor(img.rows/p_cell_size)*p_cell_size/p_windows_size[1]);
+    double min_size_ratio = std::max(5.*p_cell_size/p_windows_size[0], 5.*p_cell_size/p_windows_size[1]);
+    double max_size_ratio = std::min(floor((img.cols + p_windows_size[0]/3)/p_cell_size)*p_cell_size/p_windows_size[0], floor((img.rows + p_windows_size[1]/3)/p_cell_size)*p_cell_size/p_windows_size[1]);
     p_min_max_scale[0] = std::pow(p_scale_step, std::ceil(std::log(min_size_ratio) / log(p_scale_step)));
     p_min_max_scale[1] = std::pow(p_scale_step, std::floor(std::log(max_size_ratio) / log(p_scale_step)));
 
     std::cout << "init: img size " << img.cols << " " << img.rows << std::endl;
     std::cout << "init: win size. " << p_windows_size[0] << " " << p_windows_size[1] << std::endl;
-    std::cout << "init: min max scales: " << p_min_max_scale[0] << " " << p_min_max_scale[1] << std::endl;
+    std::cout << "init: min max scales factors: " << p_min_max_scale[0] << " " << p_min_max_scale[1] << std::endl;
 
     p_output_sigma = std::sqrt(p_pose.w*p_pose.h) * p_output_sigma_factor / static_cast<double>(p_cell_size);
 
@@ -86,14 +87,19 @@ void KCF_Tracker::init(cv::Mat &img, const cv::Rect & bbox)
     //obtain a sub-window for training initial model
     std::vector<cv::Mat> path_feat = get_features(input_rgb, input_gray, p_pose.cx, p_pose.cy, p_windows_size[0], p_windows_size[1]);
     p_model_xf = fft2(path_feat, p_cos_window);
-    //Kernel Ridge Regression, calculate alphas (in Fourier domain)
-    ComplexMat kf = gaussian_correlation(p_model_xf, p_model_xf, p_kernel_sigma, true);
 
-//    p_model_alphaf = p_yf / (kf + p_lambda);   //equation for fast training
-
-    p_model_alphaf_num = p_yf * kf;
-    p_model_alphaf_den = kf * (kf + p_lambda);
+    if (m_use_linearkernel) {
+        ComplexMat xfconj = p_model_xf.conj();
+        p_model_alphaf_num = xfconj.mul(p_yf);
+        p_model_alphaf_den = (p_model_xf * xfconj);
+    } else {
+        //Kernel Ridge Regression, calculate alphas (in Fourier domain)
+        ComplexMat kf = gaussian_correlation(p_model_xf, p_model_xf, p_kernel_sigma, true);
+        p_model_alphaf_num = p_yf * kf;
+        p_model_alphaf_den = kf * (kf + p_lambda);
+    }
     p_model_alphaf = p_model_alphaf_num / p_model_alphaf_den;
+//        p_model_alphaf = p_yf / (kf + p_lambda);   //equation for fast training
 }
 
 void KCF_Tracker::setTrackerPose(BBox_c &bbox, cv::Mat & img)
@@ -157,8 +163,12 @@ void KCF_Tracker::track(cv::Mat &img)
                         std::vector<cv::Mat> patch_feat_async = get_features(input_rgb, input_gray, this->p_pose.cx, this->p_pose.cy, this->p_windows_size[0],
                                                   this->p_windows_size[1], this->p_current_scale * this->p_scales[i]);
                         ComplexMat zf = fft2(patch_feat_async, this->p_cos_window);
-                        ComplexMat kzf = gaussian_correlation(zf, this->p_model_xf, this->p_kernel_sigma);
-                        return ifft2(this->p_model_alphaf * kzf);
+                        if (m_use_linearkernel)
+                            return ifft2((p_model_alphaf * zf).sum_over_channels());
+                        else {
+                            ComplexMat kzf = gaussian_correlation(zf, this->p_model_xf, this->p_kernel_sigma);
+                            return ifft2(this->p_model_alphaf * kzf);
+                        }
                     });
         }
 
@@ -184,8 +194,13 @@ void KCF_Tracker::track(cv::Mat &img)
         for (size_t i = 0; i < p_scales.size(); ++i) {
             patch_feat = get_features(input_rgb, input_gray, p_pose.cx, p_pose.cy, p_windows_size[0], p_windows_size[1], p_current_scale * p_scales[i]);
             ComplexMat zf = fft2(patch_feat, p_cos_window);
-            ComplexMat kzf = gaussian_correlation(zf, p_model_xf, p_kernel_sigma);
-            cv::Mat response = ifft2(p_model_alphaf * kzf);
+            cv::Mat response;
+            if (m_use_linearkernel)
+                response = ifft2((p_model_alphaf * zf).sum_over_channels());
+            else {
+                ComplexMat kzf = gaussian_correlation(zf, p_model_xf, p_kernel_sigma);
+                response = ifft2(p_model_alphaf * kzf);
+            }
 
             /* target location is at the maximum response. we must take into
             account the fact that, if the target doesn't move, the peak
@@ -207,14 +222,22 @@ void KCF_Tracker::track(cv::Mat &img)
     }
 
     //sub pixel quadratic interpolation from neighbours
+    if (max_response_pt.y > max_response_map.rows / 2) //wrap around to negative half-space of vertical axis
+        max_response_pt.y = max_response_pt.y - max_response_map.rows;
+    if (max_response_pt.x > max_response_map.cols / 2) //same for horizontal axis
+        max_response_pt.x = max_response_pt.x - max_response_map.cols;
+
     cv::Point2f new_location(max_response_pt.x, max_response_pt.y);
+
     if (m_use_subpixel_localization)
         new_location = sub_pixel_peak(max_response_pt, max_response_map);
 
-    if (new_location.y > max_response_map.rows / 2) //wrap around to negative half-space of vertical axis
-        new_location.y = new_location.y - max_response_map.rows;
-    if (new_location.x > max_response_map.cols / 2) //same for horizontal axis
-        new_location.x = new_location.x - max_response_map.cols;
+    p_pose.cx += p_current_scale*p_cell_size*new_location.x;
+    p_pose.cy += p_current_scale*p_cell_size*new_location.y;
+    if (p_pose.cx < 0) p_pose.cx = 0;
+    if (p_pose.cx > img.cols-1) p_pose.cx = img.cols-1;
+    if (p_pose.cy < 0) p_pose.cy = 0;
+    if (p_pose.cy > img.rows-1) p_pose.cy = img.rows-1;
 
     //sub grid scale interpolation
     double new_scale = p_scales[scale_index];
@@ -228,28 +251,30 @@ void KCF_Tracker::track(cv::Mat &img)
     if (p_current_scale > p_min_max_scale[1])
         p_current_scale = p_min_max_scale[1];
 
-    p_pose.cx += p_cell_size*new_location.x;
-    p_pose.cy += p_cell_size*new_location.y;
-    if (p_pose.cx < 0) p_pose.cx = 0;
-    if (p_pose.cx > img.cols-1) p_pose.cx = img.cols-1;
-    if (p_pose.cy < 0) p_pose.cy = 0;
-    if (p_pose.cy > img.rows-1) p_pose.cy = img.rows-1;
-
     //obtain a subwindow for training at newly estimated target position
     patch_feat = get_features(input_rgb, input_gray, p_pose.cx, p_pose.cy, p_windows_size[0], p_windows_size[1], p_current_scale);
     ComplexMat xf = fft2(patch_feat, p_cos_window);
-    //Kernel Ridge Regression, calculate alphas (in Fourier domain)
-    ComplexMat kf = gaussian_correlation(xf, xf, p_kernel_sigma, true);
 
     //subsequent frames, interpolate model
     p_model_xf = p_model_xf * (1. - p_interp_factor) + xf * p_interp_factor;
-//    ComplexMat alphaf = p_yf / (kf + p_lambda); //equation for fast training
-//    p_model_alphaf = p_model_alphaf * (1. - p_interp_factor) + alphaf * p_interp_factor;
 
-    ComplexMat alphaf_num = p_yf * kf;
-    ComplexMat alphaf_den = kf * (kf + p_lambda);
-    p_model_alphaf_num = p_model_alphaf_num * (1. - p_interp_factor) + (p_yf * kf) * p_interp_factor;
-    p_model_alphaf_den = p_model_alphaf_den * (1. - p_interp_factor) + kf * (kf + p_lambda) * p_interp_factor;
+    ComplexMat alphaf_num, alphaf_den;
+
+    if (m_use_linearkernel) {
+        ComplexMat xfconj = xf.conj();
+        alphaf_num = xfconj.mul(p_yf);
+        alphaf_den = (xf * xfconj);
+    } else {
+        //Kernel Ridge Regression, calculate alphas (in Fourier domain)
+        ComplexMat kf = gaussian_correlation(xf, xf, p_kernel_sigma, true);
+//        ComplexMat alphaf = p_yf / (kf + p_lambda); //equation for fast training
+//        p_model_alphaf = p_model_alphaf * (1. - p_interp_factor) + alphaf * p_interp_factor;
+        alphaf_num = p_yf * kf;
+        alphaf_den = kf * (kf + p_lambda);
+    }
+
+    p_model_alphaf_num = p_model_alphaf_num * (1. - p_interp_factor) + alphaf_num * p_interp_factor;
+    p_model_alphaf_den = p_model_alphaf_den * (1. - p_interp_factor) + alphaf_den * p_interp_factor;
     p_model_alphaf = p_model_alphaf_num / p_model_alphaf_den;
 }
 
@@ -290,11 +315,10 @@ std::vector<cv::Mat> KCF_Tracker::get_features(cv::Mat & input_rgb, cv::Mat & in
         //use rgb color space
         cv::Mat patch_rgb_norm;
         patch_rgb.convertTo(patch_rgb_norm, CV_32F, 1. / 255., -0.5);
-        std::vector<cv::Mat> rgb;
-        cv::Mat ch1_r(patch_rgb_norm.size(), CV_32FC1);
-        cv::Mat ch2_b(patch_rgb_norm.size(), CV_32FC1);
-        cv::Mat ch3_g(patch_rgb_norm.size(), CV_32FC1);
-        rgb = {ch1_r, ch2_b, ch3_g};
+        cv::Mat ch1(patch_rgb_norm.size(), CV_32FC1);
+        cv::Mat ch2(patch_rgb_norm.size(), CV_32FC1);
+        cv::Mat ch3(patch_rgb_norm.size(), CV_32FC1);
+        std::vector<cv::Mat> rgb = {ch1, ch2, ch3};
         cv::split(patch_rgb_norm, rgb);
         color_feat.insert(color_feat.end(), rgb.begin(), rgb.end());
     }
@@ -304,9 +328,7 @@ std::vector<cv::Mat> KCF_Tracker::get_features(cv::Mat & input_rgb, cv::Mat & in
         color_feat.insert(color_feat.end(), cn_feat.begin(), cn_feat.end());
     }
 
-
     hog_feat.insert(hog_feat.end(), color_feat.begin(), color_feat.end());
-
     return hog_feat;
 }
 
@@ -477,7 +499,7 @@ cv::Mat KCF_Tracker::get_subwindow(const cv::Mat &input, int cx, int cy, int wid
 
     //out of image
     if (x1 >= input.cols || y1 >= input.rows || x2 < 0 || y2 < 0) {
-        patch.create(height, width, CV_32FC1);
+        patch.create(height, width, input.type());
         patch.setTo(0.f);
         return patch;
     }
@@ -592,12 +614,14 @@ cv::Point2f KCF_Tracker::sub_pixel_peak(cv::Point & max_loc, cv::Mat & response)
     cv::Mat x;
     cv::solve(A, fval, x, cv::DECOMP_SVD);
 
-    float a = x.at<float>(0), b = x.at<float>(1), c = x.at<float>(2),
-          d = x.at<float>(3), e = x.at<float>(4);
+    double a = x.at<float>(0), b = x.at<float>(1), c = x.at<float>(2),
+           d = x.at<float>(3), e = x.at<float>(4);
 
-    cv::Point2f sub_peak;
-    sub_peak.y = ((2.f*a*e)/b - d)/(b - (4*a*c)/b);
-    sub_peak.x = (-2*c*sub_peak.y - e)/b;
+    cv::Point2f sub_peak(max_loc.x, max_loc.y);
+    if (b > 0 || b < 0) {
+        sub_peak.y = ((2.f * a * e) / b - d) / (b - (4 * a * c) / b);
+        sub_peak.x = (-2 * c * sub_peak.y - e) / b;
+    }
 
     return sub_peak;
 }
@@ -630,6 +654,9 @@ double KCF_Tracker::sub_grid_scale(std::vector<double> & responses, int index)
 
     cv::Mat x;
     cv::solve(A, fval, x, cv::DECOMP_SVD);
-    float a = x.at<float>(0), b = x.at<float>(1);
-    return -b / (2 * a);
+    double a = x.at<float>(0), b = x.at<float>(1);
+    double scale = p_scales[index];
+    if (a > 0 || a < 0)
+        scale = -b / (2 * a);
+    return scale;
 }
